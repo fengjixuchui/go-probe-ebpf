@@ -1,11 +1,10 @@
-#include "ebpf/probe.h"
-#include "ebpf/probe.skel.h"
-#include "go/symbol/line_table.h"
-#include "go/symbol/build_info.h"
 #include <bpf/bpf.h>
 #include <zero/log.h>
 #include <zero/cmdline.h>
-#include <sys/user.h>
+#include <zero/os/process.h>
+#include <go/symbol/reader.h>
+#include "ebpf/probe.h"
+#include "ebpf/probe.skel.h"
 
 int onLog(libbpf_print_level level, const char *format, va_list args) {
     va_list copy;
@@ -35,47 +34,49 @@ int onLog(libbpf_print_level level, const char *format, va_list args) {
     return length;
 }
 
+#ifdef USE_RING_BUFFER
 int onEvent(void *ctx, void *data, size_t size) {
-    auto e = (event *) data;
-    auto context = (std::tuple<int, CLineTable *> *) ctx;
+#else
+void onEvent(void *ctx, int cpu, void *data, __u32 size) {
+#endif
+    auto event = (go_probe_event *) data;
+    auto &[map, symbolTable] = *(std::pair<bpf_map *, go::symbol::SymbolTable &> *) ctx;
 
-    int fd = std::get<0>(*context);
-    CLineTable *lineTable = std::get<1>(*context);
-
-    LOG_INFO("pid: %d class: %d method: %d", e->pid, e->class_id, e->method_id);
+    LOG_INFO("pid: %d class: %d method: %d", event->pid, event->class_id, event->method_id);
 
     std::list<std::string> args;
     std::list<std::string> stackTrace;
 
-    for (int i = 0; i < e->count; i++)
-        args.emplace_back(e->args[i], ARG_LENGTH);
+    for (int i = 0; i < event->count; i++)
+        args.emplace_back(event->args[i], ARG_LENGTH);
 
     for (int i = 0; i < TRACE_COUNT; i++) {
-        CFunc func = {};
+        auto it = symbolTable.find(event->stack_trace[i]);
 
-        if (!lineTable->findFunc(e->stack_trace[i], func))
+        if (it == symbolTable.end())
             break;
 
         char stack[4096] = {};
+        go::symbol::Symbol symbol = it.operator*().symbol();
 
         snprintf(stack, sizeof(stack),
                  "%s %s:%d +0x%lx",
-                 func.getName(),
-                 func.getSourceFile(e->stack_trace[i]),
-                 func.getSourceLine(e->stack_trace[i]),
-                 e->stack_trace[i] - func.getEntry()
+                 symbol.name(),
+                 symbol.sourceFile(event->stack_trace[i]),
+                 symbol.sourceLine(event->stack_trace[i]),
+                 event->stack_trace[i] - symbol.entry()
         );
 
         stackTrace.emplace_back(stack);
 
-        if (i != TRACE_COUNT - 1 && e->stack_trace[i + 1] == 0) {
-            if (func.isStackTop())
+        if (i != TRACE_COUNT - 1 && event->stack_trace[i + 1] == 0) {
+            if (symbol.isStackTop())
                 break;
 
-            uintptr_t pc = e->stack_trace[i];
-            int frame_size = func.getFrameSize(pc);
+            uintptr_t pc = event->stack_trace[i];
+            int frame_size = symbol.frameSize(pc);
 
-            bpf_map_update_elem(fd, &pc, &frame_size, BPF_NOEXIST);
+            bpf_map__update_elem(map, &pc, sizeof(pc), &frame_size, sizeof(frame_size), BPF_NOEXIST);
 
             break;
         }
@@ -87,112 +88,137 @@ int onEvent(void *ctx, void *data, size_t size) {
             zero::strings::join(stackTrace, " ").c_str()
     );
 
+#ifdef USE_RING_BUFFER
     return 0;
-}
-
-bool getBaseAddress(const std::string &path, uintptr_t &address) {
-    ELFIO::elfio reader;
-
-    if (!reader.load(path))
-        return false;
-
-    std::vector<ELFIO::segment *> loads;
-
-    std::copy_if(
-            reader.segments.begin(),
-            reader.segments.end(),
-            std::back_inserter(loads),
-            [](const auto &i){
-                return i->get_type() == PT_LOAD;
-            });
-
-    auto minElement = std::min_element(
-            loads.begin(),
-            loads.end(),
-            [](const auto &i, const auto &j) {
-                return i->get_virtual_address() < j->get_virtual_address();
-            });
-
-    address = (*minElement)->get_virtual_address() & ~(PAGE_SIZE - 1);
-
-    return true;
+#endif
 }
 
 int main(int argc, char **argv) {
     INIT_CONSOLE_LOG(zero::INFO);
 
-    zero::CCmdline cmdline;
+    zero::Cmdline cmdline;
 
-    cmdline.add({"pid", "process id", zero::value<int>()});
+    cmdline.add<int>("pid", "process id");
     cmdline.parse(argc, argv);
 
     int pid = cmdline.get<int>("pid");
-    std::string path = zero::filesystem::path::join("/proc", std::to_string(pid), "exe");
 
-    CLineTable lineTable = {};
+    std::error_code ec;
 
-    if (!lineTable.load(std::string(path))) {
-        LOG_ERROR("line table load failed");
+    std::filesystem::path path = std::filesystem::path("/proc") / std::to_string(pid) / "exe";
+    std::filesystem::path realPath = std::filesystem::read_symlink(path, ec);
+
+    if (ec) {
+        LOG_ERROR("read symbol link failed, %s", ec.message().c_str());
         return -1;
     }
 
-    CBuildInfo buildInfo = {};
+    go::symbol::Reader reader;
 
-    if (buildInfo.load(path)) {
-        LOG_INFO("go version: %s", buildInfo.mVersion.c_str());
-    }
-
-    uintptr_t base;
-
-    if (!getBaseAddress(path, base)) {
-        LOG_ERROR("failed to get elf base address");
+    if (!reader.load(path)) {
+        LOG_ERROR("load golang binary failed");
         return -1;
     }
 
-    CFunc func = {};
+    std::optional<go::symbol::BuildInfo> buildInfo = reader.buildInfo();
 
-    if (!lineTable.findFunc("os/exec.(*Cmd).Start", func)) {
-        LOG_ERROR("failed to get function address");
+    if (!buildInfo) {
+        LOG_ERROR("get build info failed");
         return -1;
     }
 
-    LOG_INFO("base: 0x%lx entry: 0x%lx", base, func.getEntry());
+    std::optional<std::string> version = buildInfo->version();
+
+    if (!version) {
+        LOG_ERROR("get golang version failed");
+        return -1;
+    }
+
+    std::optional<std::tuple<int, int>> versionNumber = buildInfo->versionNumber();
+
+    if (!versionNumber) {
+        LOG_ERROR("get golang version number failed");
+        return -1;
+    }
+
+    auto [major, minor] = *versionNumber;
+
+    LOG_INFO("golang version: %d.%d", major, minor);
+
+    std::optional<zero::os::process::ProcessMapping> processMapping = zero::os::process::getImageBase(
+            pid,
+            std::filesystem::read_symlink(path).string()
+    );
+
+    if (!processMapping) {
+        LOG_INFO("get image base failed");
+        return -1;
+    }
+
+    LOG_INFO("image base: %p", processMapping->start);
+
+    std::optional<go::symbol::SymbolTable> symbolTable = reader.symbols(go::symbol::FileMapping, processMapping->start);
+
+    if (!symbolTable) {
+        LOG_INFO("get symbol table failed");
+        return -1;
+    }
+
+    auto it = symbolTable->find("os/exec.(*Cmd).Start");
+
+    if (it == symbolTable->end()) {
+        LOG_INFO("find symbol failed");
+        return -1;
+    }
 
     libbpf_set_strict_mode(LIBBPF_STRICT_ALL);
     libbpf_set_print(onLog);
 
-    probe_bpf *skeleton = probe_bpf__open_and_load();
+    probe_bpf *skeleton = probe_bpf::open_and_load();
 
     if (!skeleton) {
         LOG_ERROR("failed to open and load BPF skeleton");
         return -1;
     }
 
-    skeleton->bss->register_based = buildInfo.mRegisterBased;
+#ifdef BPF_NO_GLOBAL_DATA
+    uint32_t index = 0;
+    int registerBased = major > 1 || (major == 1 && minor >= 7);
+
+    if (bpf_map__update_elem(skeleton->maps.config_map, &index, sizeof(index), &registerBased, sizeof(registerBased), BPF_ANY) < 0) {
+        LOG_ERROR("update map failed");
+        probe_bpf::destroy(skeleton);
+        return -1;
+    }
+#else
+    skeleton->bss->register_based = major > 1 || (major == 1 && minor >= 7);
+#endif
+
     skeleton->links.cmd_start = bpf_program__attach_uprobe(
             skeleton->progs.cmd_start,
             false,
             pid,
-            path.c_str(),
-            func.getEntry() - base
+            path.string().c_str(),
+            it.operator*().symbol().entry() - processMapping->start
     );
 
     if (!skeleton->links.cmd_start) {
         LOG_ERROR("failed to attach: %s", strerror(errno));
-        probe_bpf__destroy(skeleton);
+        probe_bpf::destroy(skeleton);
         return -1;
     }
 
-    std::tuple<int, CLineTable *> context = {
-            bpf_map__fd(skeleton->maps.map),
-            &lineTable
+    std::pair<bpf_map *, go::symbol::SymbolTable &> context = {
+            skeleton->maps.frame_map,
+            *symbolTable
     };
 
-    ring_buffer *rb = ring_buffer__new(bpf_map__fd(skeleton->maps.rb), onEvent, &context, nullptr);
+#ifdef USE_RING_BUFFER
+    ring_buffer *rb = ring_buffer__new(bpf_map__fd(skeleton->maps.events), onEvent, &context, nullptr);
 
     if (!rb) {
         LOG_ERROR("failed to create ring buffer: %s", strerror(errno));
-        probe_bpf__destroy(skeleton);
+        probe_bpf::destroy(skeleton);
         return -1;
     }
 
@@ -201,7 +227,23 @@ int main(int argc, char **argv) {
     }
 
     ring_buffer__free(rb);
-    probe_bpf__destroy(skeleton);
+#else
+    perf_buffer *pb = perf_buffer__new(bpf_map__fd(skeleton->maps.events), 64, onEvent, nullptr, &context, nullptr);
+
+    if (!pb) {
+        LOG_ERROR("failed to create perf buffer: %s", strerror(errno));
+        probe_bpf::destroy(skeleton);
+        return -1;
+    }
+
+    while (perf_buffer__poll(pb, 100) >= 0) {
+
+    }
+
+    perf_buffer__free(pb);
+#endif
+
+    probe_bpf::destroy(skeleton);
 
     return 0;
 }
