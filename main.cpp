@@ -1,10 +1,10 @@
+#include "ebpf/src/event.h"
+#include "ebpf/probe.skel.h"
 #include <bpf/bpf.h>
 #include <zero/log.h>
 #include <zero/cmdline.h>
 #include <zero/os/process.h>
 #include <go/symbol/reader.h>
-#include "ebpf/probe.h"
-#include "ebpf/probe.skel.h"
 
 int onLog(libbpf_print_level level, const char *format, va_list args) {
     va_list copy;
@@ -15,7 +15,7 @@ int onLog(libbpf_print_level level, const char *format, va_list args) {
     if (length <= 0)
         return 0;
 
-    std::unique_ptr<char> buffer(new char[length + 1]);
+    std::unique_ptr<char[]> buffer = std::make_unique<char[]>(length + 1);
     vsnprintf(buffer.get(), length + 1, format, copy);
 
     switch (level) {
@@ -48,7 +48,7 @@ void onEvent(void *ctx, int cpu, void *data, __u32 size) {
     std::list<std::string> stackTrace;
 
     for (int i = 0; i < event->count; i++)
-        args.emplace_back(event->args[i], ARG_LENGTH);
+        args.emplace_back(event->args[i]);
 
     for (int i = 0; i < TRACE_COUNT; i++) {
         auto it = symbolTable.find(event->stack_trace[i]);
@@ -194,15 +194,15 @@ int main(int argc, char **argv) {
     skeleton->bss->register_based = major > 1 || (major == 1 && minor >= 7);
 #endif
 
-    skeleton->links.cmd_start = bpf_program__attach_uprobe(
-            skeleton->progs.cmd_start,
+    skeleton->links.os_exec_cmd_start = bpf_program__attach_uprobe(
+            skeleton->progs.os_exec_cmd_start,
             false,
             pid,
             path.string().c_str(),
             it.operator*().symbol().entry() - processMapping->start
     );
 
-    if (!skeleton->links.cmd_start) {
+    if (!skeleton->links.os_exec_cmd_start) {
         LOG_ERROR("failed to attach: %s", strerror(errno));
         probe_bpf::destroy(skeleton);
         return -1;
