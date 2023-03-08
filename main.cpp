@@ -5,28 +5,34 @@
 #include "ebpf/probe.skel.h"
 #include <Zydis/Zydis.h>
 #include <zero/log.h>
-#include <zero/os/process.h>
+#include <zero/os/procfs.h>
 #include <zero/cache/lru.h>
 #include <aio/ev/timer.h>
 #include <aio/ev/buffer.h>
 #include <go/symbol/reader.h>
+#include <iostream>
+#include <sys/prctl.h>
 #include <unistd.h>
 #include <csignal>
+
+using namespace std::chrono_literals;
 
 constexpr auto MAX_OFFSET = 100;
 constexpr auto INSTRUCTION_BUFFER_SIZE = 128;
 constexpr auto FRAME_CACHE_SIZE = 128;
 constexpr auto DEFAULT_QUOTAS = 12000;
 
-constexpr auto TRACK_HTTP_VERSION = go::symbol::Version{1, 12};
-constexpr auto REGISTER_BASED_VERSION = go::symbol::Version{1, 17};
-constexpr auto FRAME_POINTER_VERSION = go::symbol::Version{1, 7};
+constexpr auto TRACK_HTTP_VERSION = go::Version{1, 12};
+constexpr auto REGISTER_BASED_VERSION = go::Version{1, 17};
+constexpr auto FRAME_POINTER_VERSION = go::Version{1, 7};
 
 struct Instance {
     std::string version;
-    go::symbol::SymbolTable symbolTable;
+    go::symbol::seek::SymbolTable symbolTable;
     std::list<std::unique_ptr<bpf_link, decltype(bpf_link__destroy) *>> links;
     zero::cache::LRUCache<uintptr_t, std::string> cache;
+    unsigned long long startTime;
+    std::shared_ptr<ProcessInfo> processInfo;
     probe_config config;
     std::map<std::tuple<int, int>, Filter> filters;
     std::map<std::tuple<int, int>, int> limits;
@@ -88,7 +94,7 @@ bool filter(const Trace &trace, const std::map<std::tuple<int, int>, Filter> &fi
 }
 
 void onEvent(probe_event *event, void *ctx) {
-    auto &[skeleton, instances, channel] = *(std::tuple<probe_bpf *, std::map<pid_t, Instance> &, std::shared_ptr<aio::sync::IChannel<SmithMessage>>> *) ctx;
+    auto &[skeleton, instances, channel] = *(std::tuple<probe_bpf *, std::map<pid_t, Instance> &, std::shared_ptr<aio::IChannel<SmithMessage>>> *) ctx;
 
     auto it = instances.find(event->pid);
 
@@ -136,14 +142,14 @@ void onEvent(probe_event *event, void *ctx) {
             break;
 
         char frame[4096] = {};
-        go::symbol::Symbol symbol = symbolIterator.operator*().symbol();
+        go::symbol::seek::Symbol symbol = symbolIterator.operator*().symbol();
 
         snprintf(
                 frame,
                 sizeof(frame),
                 "%s %s:%d +0x%lx",
-                symbol.name(),
-                symbol.sourceFile(pc),
+                symbol.name().c_str(),
+                symbol.sourceFile(pc).c_str(),
                 symbol.sourceLine(pc),
                 pc - symbol.entry()
         );
@@ -171,7 +177,7 @@ void onEvent(probe_event *event, void *ctx) {
 #endif
 #endif
 
-    channel->sendNoWait({it->first, it->second.version, TRACE, trace});
+    channel->sendNoWait({it->first, it->second.version, it->second.processInfo, TRACE, trace});
 }
 
 std::optional<int> getAPIOffset(const elf::Reader &reader, uint64_t address) {
@@ -212,9 +218,9 @@ std::optional<int> getAPIOffset(const elf::Reader &reader, uint64_t address) {
     return offset;
 }
 
-std::shared_ptr<aio::sync::IChannel<pid_t>> inputChannel(const aio::Context &context) {
-    std::shared_ptr channel = std::make_shared<aio::sync::Channel<pid_t, 10>>(context);
-    std::shared_ptr buffer = std::make_shared<aio::ev::Buffer>(bufferevent_socket_new(context.base, STDIN_FILENO, 0));
+std::shared_ptr<aio::IChannel<pid_t>> inputChannel(const std::shared_ptr<aio::Context> &context) {
+    std::shared_ptr channel = std::make_shared<aio::Channel<pid_t, 10>>(context);
+    std::shared_ptr buffer = std::make_shared<aio::ev::Buffer>(bufferevent_socket_new(context->base(), STDIN_FILENO, 0));
 
     zero::async::promise::loop<void>([=](const auto &loop) {
         buffer->readLine(EVBUFFER_EOL_ANY)->then([=](const std::string &line) {
@@ -239,23 +245,28 @@ std::shared_ptr<aio::sync::IChannel<pid_t>> inputChannel(const aio::Context &con
 }
 
 std::optional<Instance> attach(probe_bpf *skeleton, pid_t pid) {
-    std::error_code ec;
+    std::optional<zero::os::procfs::Process> process = zero::os::procfs::openProcess(pid);
 
-    std::filesystem::path realPath = std::filesystem::read_symlink(
-            std::filesystem::path("/proc") / std::to_string(pid) / "exe",
-            ec
-    );
-
-    if (ec) {
-        LOG_ERROR("read symbol link failed, %s", ec.message().c_str());
+    if (!process) {
+        LOG_ERROR("open process %d failed", pid);
         return std::nullopt;
     }
 
-    std::filesystem::path path = std::filesystem::path("/proc") / std::to_string(pid) / "root" / realPath.relative_path();
+    std::optional<zero::os::procfs::Stat> stat = process->stat();
+    std::optional<zero::os::procfs::Status> status = process->status();
+    std::optional<std::filesystem::path> exe = process->exe();
+    std::optional<std::vector<std::string>> cmdline = process->cmdline();
 
-    go::symbol::Reader reader;
+    if (!stat || !status || !exe || !cmdline) {
+        LOG_ERROR("get process %d info failed", pid);
+        return std::nullopt;
+    }
 
-    if (!reader.load(path)) {
+    std::filesystem::path path = std::filesystem::path("/proc") / std::to_string(pid) / "root" / exe->relative_path();
+
+    std::optional<elf::Reader> reader = elf::openFile(path);
+
+    if (!reader) {
         LOG_ERROR("load golang binary failed: %s", path.string().c_str());
         return std::nullopt;
     }
@@ -264,7 +275,8 @@ std::optional<Instance> attach(probe_bpf *skeleton, pid_t pid) {
     bool fp = false;
     bool http = false;
 
-    std::optional<go::symbol::Version> version = reader.version();
+    go::symbol::Reader symbolReader(*reader, path);
+    std::optional<go::Version> version = symbolReader.version();
 
     if (version) {
         LOG_INFO("golang version: %d.%d", version->major, version->minor);
@@ -276,21 +288,22 @@ std::optional<Instance> attach(probe_bpf *skeleton, pid_t pid) {
 
     LOG_INFO("process %d: abi(%d) fp(%d) http(%d)", pid, abi, fp, http);
 
-    std::optional<zero::os::process::ProcessMapping> processMapping = zero::os::process::getImageBase(
-            pid,
-            realPath.string()
-    );
+    std::optional<zero::os::procfs::MemoryMapping> memoryMapping = process->getImageBase(exe->string());
 
-    if (!processMapping) {
+    if (!memoryMapping) {
         LOG_INFO("get image base failed");
         return std::nullopt;
     }
 
-    LOG_INFO("image base: %p", processMapping->start);
+    LOG_INFO("image base: %p", memoryMapping->start);
 
-    std::optional<go::symbol::SymbolTable> symbolTable = reader.symbols(go::symbol::FileMapping, processMapping->start);
+    std::optional<go::symbol::seek::SymbolTable> seekSymbolTable = symbolReader.symbols(memoryMapping->start);
+    std::optional<go::symbol::SymbolTable> symbolTable = symbolReader.symbols(
+            go::symbol::FileMapping,
+            memoryMapping->start
+    );
 
-    if (!symbolTable) {
+    if (!symbolTable || !seekSymbolTable) {
         LOG_INFO("get symbol table failed");
         return std::nullopt;
     }
@@ -309,12 +322,12 @@ std::optional<Instance> attach(probe_bpf *skeleton, pid_t pid) {
 
     auto attachAPI = [&](const auto &api) {
         auto it = std::find_if(symbolTable->begin(), symbolTable->end(), [&](const auto &entry) {
-            const char *name = entry.symbol().name();
+            std::string name = entry.symbol().name();
 
             if (api.ignoreCase)
-                return strcasecmp(api.name, name) == 0;
+                return strcasecmp(name.c_str(), api.name) == 0;
 
-            return strcmp(api.name, name) == 0;
+            return name == api.name;
         });
 
         if (it == symbolTable->end()) {
@@ -337,7 +350,7 @@ std::optional<Instance> attach(probe_bpf *skeleton, pid_t pid) {
 
         uint64_t entry = it.operator*().symbol().entry();
 
-        std::optional<int> offset = getAPIOffset(reader, entry);
+        std::optional<int> offset = getAPIOffset(*reader, entry);
 
         if (!offset) {
             LOG_ERROR("get api offset failed");
@@ -350,8 +363,8 @@ std::optional<Instance> attach(probe_bpf *skeleton, pid_t pid) {
                 *program->prog,
                 false,
                 pid,
-                path.string().c_str(),
-                entry + *offset - processMapping->start
+                zero::strings::format("/proc/%d/exe", pid).c_str(),
+                entry + *offset - memoryMapping->start
         );
 
         if (!link) {
@@ -369,15 +382,32 @@ std::optional<Instance> attach(probe_bpf *skeleton, pid_t pid) {
 
     return Instance{
             version ? zero::strings::format("%d.%d", version->major, version->minor) : "",
-            std::move(*symbolTable),
+            std::move(*seekSymbolTable),
             std::move(links),
             zero::cache::LRUCache<uintptr_t, std::string>(FRAME_CACHE_SIZE),
+            stat->startTime,
+            std::make_shared<ProcessInfo>(ProcessInfo{
+                    stat->session,
+                    stat->ppid,
+                    stat->tpgid,
+                    status->nspid.value_or(0),
+                    exe->string(),
+                    zero::strings::join(*cmdline, " "),
+                    status->uid[0],
+                    status->uid[1],
+                    status->uid[2],
+                    status->uid[3],
+                    status->gid[0],
+                    status->gid[1],
+                    status->gid[2],
+                    status->gid[3]
+            }),
             config
     };
 }
 
 int main() {
-    INIT_CONSOLE_LOG(zero::INFO);
+    INIT_FILE_LOG(zero::INFO_LEVEL, "go-probe-ebpf");
 
     libbpf_set_strict_mode(LIBBPF_STRICT_ALL);
     libbpf_set_print(onLog);
@@ -390,15 +420,9 @@ int main() {
     }
 
     signal(SIGPIPE, SIG_IGN);
+    prctl(PR_SET_PDEATHSIG, SIGKILL);
 
-    event_base *base = event_base_new();
-
-    if (!base) {
-        probe_bpf::destroy(skeleton);
-        return -1;
-    }
-
-    aio::Context context = {base};
+    std::shared_ptr<aio::Context> context = aio::newContext();
     std::map<pid_t, Instance> instances;
 
     zero::async::promise::loop<void>([skeleton, &instances, channel = inputChannel(context)](const auto &loop) {
@@ -413,8 +437,11 @@ int main() {
 
             if (!instance) {
                 P_CONTINUE(loop);
+                std::cout << pid << ":failed" << std::endl;
                 return;
             }
+
+            std::cout << pid << ":succeeded" << std::endl;
 
             std::fill_n(instance->quotas[0], sizeof(instance->quotas) / sizeof(**instance->quotas), DEFAULT_QUOTAS);
             instances.insert({pid, std::move(*instance)});
@@ -426,12 +453,23 @@ int main() {
         });
     });
 
-    std::make_shared<aio::ev::Timer>(context)->setInterval(std::chrono::minutes{1}, [&]() {
+    std::make_shared<aio::ev::Timer>(context)->setInterval(1min, [&]() {
         auto it = instances.begin();
 
         while (it != instances.end()) {
-            if (kill(it->first, 0) < 0 && errno == ESRCH) {
-                LOG_INFO("clean process %d", it->first);
+            std::optional<zero::os::procfs::Process> process = zero::os::procfs::openProcess(it->first);
+
+            if (!process) {
+                LOG_INFO("clean dead process %d", it->first);
+                bpf_map__delete_elem(skeleton->maps.config_map, &it->first, sizeof(pid_t), BPF_ANY);
+                it = instances.erase(it);
+                continue;
+            }
+
+            std::optional<zero::os::procfs::Stat> stat = process->stat();
+
+            if (!stat || stat->startTime != it->second.startTime) {
+                LOG_INFO("clean reused process %d", it->first);
                 bpf_map__delete_elem(skeleton->maps.config_map, &it->first, sizeof(pid_t), BPF_ANY);
                 it = instances.erase(it);
                 continue;
@@ -459,7 +497,7 @@ int main() {
         return true;
     });
 
-    std::array<std::shared_ptr<aio::sync::IChannel<SmithMessage>>, 2> channels = startClient(context);
+    std::array<std::shared_ptr<aio::IChannel<SmithMessage>>, 2> channels = startClient(context);
 
     zero::async::promise::loop<void>([channels, &instances](const auto &loop) {
         channels[0]->receive()->then([loop, &instances](const SmithMessage &message) {
@@ -524,7 +562,7 @@ int main() {
         });
     });
 
-    std::tuple<probe_bpf *, std::map<pid_t, Instance> &, std::shared_ptr<aio::sync::IChannel<SmithMessage>>> ctx = {
+    std::tuple<probe_bpf *, std::map<pid_t, Instance> &, std::shared_ptr<aio::IChannel<SmithMessage>>> ctx = {
             skeleton,
             instances,
             channels[1]
@@ -543,15 +581,18 @@ int main() {
 
     if (!rb) {
         LOG_ERROR("failed to create ring buffer: %s", strerror(errno));
-        event_base_free(base);
         probe_bpf::destroy(skeleton);
         return -1;
     }
 
-    std::make_shared<aio::ev::Event>(context, ring_buffer__epoll_fd(rb))->onPersist(EV_READ, [=](short what) {
-        ring_buffer__poll(rb, 0);
-        return true;
-    });
+    std::make_shared<aio::ev::Event>(context, bpf_map__fd(skeleton->maps.events))->onPersist(
+            EV_READ,
+            [=](short what) {
+                ring_buffer__consume(rb);
+                return true;
+            },
+            10min
+    );
 #else
     perf_buffer *pb = perf_buffer__new(
             bpf_map__fd(skeleton->maps.events),
@@ -566,21 +607,23 @@ int main() {
 
     if (!pb) {
         LOG_ERROR("failed to create perf buffer: %s", strerror(errno));
-        event_base_free(base);
         probe_bpf::destroy(skeleton);
         return -1;
     }
 
     for (size_t i = 0; i < perf_buffer__buffer_cnt(pb); i++) {
-        std::make_shared<aio::ev::Event>(context, perf_buffer__buffer_fd(pb, i))->onPersist(EV_READ, [=](short what) {
-            perf_buffer__consume_buffer(pb, i);
-            return true;
-        });
+        std::make_shared<aio::ev::Event>(context, perf_buffer__buffer_fd(pb, i))->onPersist(
+                EV_READ,
+                [=](short what) {
+                    perf_buffer__consume_buffer(pb, i);
+                    return true;
+                },
+                10min
+        );
     }
 #endif
 
-    event_base_dispatch(base);
-    event_base_free(base);
+    context->dispatch();
 
 #ifdef USE_RING_BUFFER
     ring_buffer__free(rb);

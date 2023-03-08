@@ -7,8 +7,8 @@ constexpr auto SOCKET_PATH = "/var/run/smith_agent.sock";
 
 std::shared_ptr<zero::async::promise::Promise<void>>
 transfer(
-        const aio::Context &context,
-        const std::array<std::shared_ptr<aio::sync::IChannel<SmithMessage>>, 2> &channels
+        const std::shared_ptr<aio::Context> &context,
+        const std::array<std::shared_ptr<aio::IChannel<SmithMessage>>, 2> &channels
 ) {
     return aio::net::connect(context, SOCKET_PATH)->then([=](const std::shared_ptr<aio::ev::IBuffer> &buffer) {
         return zero::async::promise::all(
@@ -41,9 +41,11 @@ transfer(
                         uint32_t length = htonl(msg.length());
 
                         buffer->write(&length, sizeof(uint32_t));
-                        buffer->write(msg);
 
-                        return buffer->drain();
+                        if (buffer->write(msg) > 1024 * 1024)
+                            return buffer->drain();
+
+                        return zero::async::promise::resolve<void>();
                     })->then([=]() {
                         P_CONTINUE(loop);
                     }, [=](const zero::async::promise::Reason &reason) {
@@ -56,10 +58,10 @@ transfer(
     });
 }
 
-std::array<std::shared_ptr<aio::sync::IChannel<SmithMessage>>, 2> startClient(const aio::Context &context) {
-    std::array<std::shared_ptr<aio::sync::IChannel<SmithMessage>>, 2> channels = {
-            std::make_shared<aio::sync::Channel<SmithMessage, 100>>(context),
-            std::make_shared<aio::sync::Channel<SmithMessage, 100>>(context)
+std::array<std::shared_ptr<aio::IChannel<SmithMessage>>, 2> startClient(const std::shared_ptr<aio::Context> &context) {
+    std::array<std::shared_ptr<aio::IChannel<SmithMessage>>, 2> channels = {
+            std::make_shared<aio::Channel<SmithMessage, 100>>(context),
+            std::make_shared<aio::Channel<SmithMessage, 100>>(context)
     };
 
     zero::async::promise::loop<void>([=](const auto &loop) {
